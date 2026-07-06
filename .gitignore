@@ -1,0 +1,22 @@
+## .NET build output
+bin/
+obj/
+publish/
+*.user
+*.suo
+.vs/
+
+## Compiled shim (release separately if at all)
+src/ElectronShim.exe
+
+## Local logs / state
+*.log
+*.seen
+
+## OS junk
+Thumbs.db
+.DS_Store
+
+## IDE
+.vscode/
+.idea/
