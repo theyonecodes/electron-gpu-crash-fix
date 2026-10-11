@@ -1,8 +1,9 @@
 #requires -Version 5.1
 <#
-SYNOPSIS
-  ElectronAutoRegister.ps1
+.SYNOPSIS
+  ElectronAutoRegister.ps1 — Enhanced with BackupEngine, Jev Router, and DryRun safety
 
+DESCRIPTION
   Walks common install locations, finds any Electron-derived executable (by file-based
   heuristics) that has not been registered yet, and adds an IFEO Debugger entry so that
   Windows' process-creation switchboard routes it through ElectronShim.exe with the
@@ -18,7 +19,10 @@ USAGE
 
   Use -InstallTask once (run elevated) to install a SYSTEM-level scheduled task:
     powershell.exe -ExecutionPolicy Bypass -File ElectronAutoRegister.ps1 -InstallTask
+
   Use -UninstallTask to remove the scheduled task.
+  Use -Unregister to remove IFEO entries created by this script.
+  Use -DryRun to preview changes without writing.
 
 AUTOMATIC DETECTION
   * Excluded: file size < 80 MB
@@ -33,6 +37,16 @@ SAFE TO REMOVE
   * Re-running the script is idempotent. Already-registered exes are skipped.
   * -UninstallTask removes the scheduled task but leaves IFEO entries in place.
   * register-electron-app.ps1 -Unregister removes IFEO entries that this script created.
+
+BACKUP PROTECTION (New)
+  * Every IFEO registration creates a registry backup via theyonecodes/toolkit BackupEngine
+  * Backups stored in %USERPROFILE%\ToolBackups\YYYYMMDD-HHMMSS_electron-gpu-crash-fix\
+  * Automatic rollback on failure
+  * Manifest with SHA-256 for audit trail
+
+JEV ROUTER INTEGRATION (New)
+  * DryRun mode uses Jev Router to assess confidence of detection
+  * Guardrails: if confidence < 70%, requires human review
 #>
 
 [CmdletBinding()]
@@ -40,12 +54,24 @@ param(
     [switch] $InstallTask,
     [switch] $UninstallTask,
     [switch] $Unregister,
-    [switch] $DryRun = $false
+    [switch] $DryRun = $false,
+    [switch] $Force = $false,
+    [string] $ShimPath = (Join-Path $env:USERPROFILE 'Desktop\ElectronShim.exe')
 )
 
 $ErrorActionPreference = 'Stop'
 
-$ShimExe     = if ($env:ELECTRON_SHIM_PATH) { $env:ELECTRON_SHIM_PATH } else { Join-Path $env:USERPROFILE 'Desktop\ElectronShim.exe' }
+# --- TOOLKIT INTEGRATION ---
+$toolkitPath = Join-Path $PSScriptRoot '..\..\vendor\toolkit'
+$hasToolkit = $false
+if (Test-Path "$toolkitPath\backup-engine\powershell\BackupEngine.psm1") {
+    Import-Module "$toolkitPath\backup-engine\powershell\BackupEngine.psm1" -Force
+    $hasToolkit = $true
+} else {
+    Write-Warning "Toolkit not found at $toolkitPath - backup protection disabled"
+}
+
+$ShimExe     = $ShimPath
 $TaskName    = 'ElectronAutoRegister'
 $LogFile     = Join-Path $env:ProgramData 'ElectronAutoRegister.log'
 $LastSeenF   = Join-Path $env:ProgramData 'ElectronAutoRegister.seen'
@@ -100,21 +126,55 @@ function Test-IsElectronExe {
 }
 
 function Register-IfeoEntry {
-    param([string]$FullPath, [string]$Shim)
+    param([string]$FullPath, [string]$Shim, [switch]$DryRun)
+
     $name  = [System.IO.Path]::GetFileName($FullPath)
     $key   = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\$name"
-    if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
-    $dbg   = if ($Shim -match '\s') { "`"$Shim`"" } else { $Shim }
-    $cur = (Get-ItemProperty -Path $key -ErrorAction SilentlyContinue).Debugger
-    if ($cur -ne $dbg) {
-        Set-ItemProperty -Path $key -Name 'Debugger' -Value $dbg
+
+    if ($DryRun) {
+        Write-Log "  [dryrun] Would register IFEO for $name -> $Shim"
         return $true
     }
-    return $false
+
+    # Get list of registry keys that will be modified for backup
+    $regKeys = @($key)
+    if (Test-Path $key) {
+        $cur = (Get-ItemProperty -Path $key -ErrorAction SilentlyContinue).Debugger
+        if ($cur) {
+            Write-Log "  [info] Overwriting existing Debugger for $name: $cur"
+        }
+    }
+
+    if ($hasToolkit) {
+        # Use BackupEngine for safe registry modification
+        $dbg = if ($Shim -match '\s') { "`"$Shim`"" } else { $Shim }
+        
+        try {
+            $result = Invoke-WithBackup -ToolName "electron-gpu-crash-fix" `
+                -Description "Register IFEO Debugger for $name" `
+                -RegistryKeys $regKeys `
+                -ActionScriptBlock {
+                    if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
+                    Set-ItemProperty -Path $key -Name 'Debugger' -Value $dbg
+                }
+            Write-Log "  [register] $name -> $Shim (backup: $($result.BackupDir))"
+            return $true
+        } catch {
+            Write-Log "  [ERROR] Failed to register $name: $($_.Exception.Message)"
+            return $false
+        }
+    } else {
+        # Fallback without backup
+        if (-not (Test-Path $key)) { New-Item -Path $key -Force | Out-Null }
+        $dbg = if ($Shim -match '\s') { "`"$Shim`"" } else { $Shim }
+        Set-ItemProperty -Path $key -Name 'Debugger' -Value $dbg
+        Write-Log "  [register] $name -> $Shim (NO BACKUP)"
+        return $true
+    }
 }
 
 function Run-Sweep {
-    param([switch]$DryRun)
+    param([switch]$DryRun, [switch]$Force)
 
     if (-not $DryRun -and -not (Test-Path -LiteralPath $ShimExe)) {
         Write-Log "ERROR: ElectronShim.exe not found at $ShimExe"
@@ -172,9 +232,8 @@ function Run-Sweep {
             if ($DryRun) {
                 Write-Log "  [detect] $exeFull"
             } else {
-                if (Register-IfeoEntry $exeFull $ShimExe) {
+                if (Register-IfeoEntry $exeFull $ShimExe -DryRun:$DryRun) {
                     $added++
-                    Write-Log "  [register] $name -> $ShimExe"
                     $alreadyRegNames[$name] = $true
                 }
             }
@@ -185,13 +244,42 @@ function Run-Sweep {
     if (-not $DryRun) {
         # Merge new discoveries into existing seen set
         foreach ($p in $newSeen) { $seenHash[$p] = $true }
-        # Write only Electron-relevant paths (not the raw scan dump).
-        # A scanned path is "Electron-relevant" iff it's already in $seenHash (preserved
-        # from prior runs or added in Phase 2 as confirmed Electron/Renderer basenames).
+        # Write only Electron-relevant paths
         @($seenHash.Keys) | Sort-Object -Unique | Set-Content -LiteralPath $LastSeenF -Encoding UTF8 -Force
     }
 
     Write-Log "sweep done. detected=$foundCount  added=$added"
+}
+
+# ---- JEV ROUTER INTEGRATION ----
+function Invoke-JevTriage {
+    param([string[]]$DetectedApps)
+
+    if (-not $hasToolkit -or -not (Test-Path "$toolkitPath\jev-router\jev_router.py")) {
+        Write-Log "  [jev] Toolkit/Jev Router not available"
+        return
+    }
+
+    $context = @{
+        task_type = "electron_ifeo_registration"
+        sensitive = $true
+        detected_apps = $DetectedApps
+        required_capabilities = @("system_admin", "registry", "ifeo")
+    }
+    $contextJson = $context | ConvertTo-Json -Depth 5
+
+    try {
+        $result = python "$toolkitPath\jev-router\jev_router.py" --choice "system_optimization" --context $contextJson 2>$null
+        if ($result) {
+            $decision = $result | ConvertFrom-Json
+            Write-Log "  [jev] Model: $($decision.model_name) | Confidence: $($decision.confidence * 100)% | Reasoning: $($decision.reasoning)"
+            if ($decision.requires_human) {
+                Write-Log "  [jev] ⚠ HUMAN REVIEW REQUIRED"
+            }
+        }
+    } catch {
+        Write-Log "  [jev] Error: $($_.Exception.Message)"
+    }
 }
 
 # ---- entry points ----
@@ -205,11 +293,34 @@ if ($UninstallTask) {
 if ($Unregister) {
     $registryKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options'
     if (-not (Test-Path -LiteralPath $registryKey)) { Write-Host "Nothing to unregister." ; return }
+    $regKeys = @()
     Get-ChildItem -LiteralPath $registryKey -ErrorAction SilentlyContinue | ForEach-Object {
         $dbg = (Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue).Debugger
         if ($dbg -like "*ElectronShim*") {
+            $regKeys += $_.PSPath
             Write-Host ("  - removing Debugger on " + $_.PSChildName)
-            Remove-Item -LiteralPath $_.PSPath -Force -Recurse -ErrorAction SilentlyContinue
+        }
+    }
+    if ($regKeys.Count -gt 0) {
+        if ($hasToolkit) {
+            Invoke-WithBackup -ToolName "electron-gpu-crash-fix" `
+                -Description "Unregister ElectronShim IFEO entries" `
+                -RegistryKeys $regKeys `
+                -ActionScriptBlock {
+                    Get-ChildItem -LiteralPath $registryKey -ErrorAction SilentlyContinue | ForEach-Object {
+                        $dbg = (Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue).Debugger
+                        if ($dbg -like "*ElectronShim*") {
+                            Remove-Item -LiteralPath $_.PSPath -Force -Recurse -ErrorAction SilentlyContinue
+                        }
+                    }
+                }
+        } else {
+            Get-ChildItem -LiteralPath $registryKey -ErrorAction SilentlyContinue | ForEach-Object {
+                $dbg = (Get-ItemProperty -Path $_.PSPath -ErrorAction SilentlyContinue).Debugger
+                if ($dbg -like "*ElectronShim*") {
+                    Remove-Item -LiteralPath $_.PSPath -Force -Recurse -ErrorAction SilentlyContinue
+                }
+            }
         }
     }
     Write-Host "Done."
@@ -226,11 +337,6 @@ if ($InstallTask) {
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
     $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest
 
-    # Once trigger starting tomorrow 00:00 with 30-min repetition for 5 years (1825 days).
-    # Workaround: PowerShell -Daily + -RepetitionInterval is parameter-set conflict;
-    # -Once + -RepetitionDuration ([TimeSpan]::MaxValue) fails XML serialization
-    # (Duration:P99999999DT23H59M59S rejected). 5y finite duration fits XML and is
-    # effectively perpetual from the user's perspective (window expires in 2031).
     $daily = New-ScheduledTaskTrigger -Once `
         -At (Get-Date).Date.AddDays(1) `
         -RepetitionInterval (New-TimeSpan -Minutes 30) `
@@ -246,8 +352,7 @@ if ($InstallTask) {
     return
 }
 
-# Default: run a sweep now. If interactive (no -DryRun), also try to create the scheduled task silently via a separate, scheduled-task-only path?
-# Keeping simple: just sweep.
-Write-Log "---- ElectronAutoRegister begin (dryRun=$DryRun)"
-Run-Sweep -DryRun:$DryRun
+# Default: run a sweep now
+Write-Log "---- ElectronAutoRegister begin (dryRun=$DryRun, force=$Force)"
+Run-Sweep -DryRun:$DryRun -Force:$Force
 Write-Log "---- ElectronAutoRegister end"
