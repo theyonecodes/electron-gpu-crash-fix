@@ -1,0 +1,164 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint-and-test:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: false
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+    
+    - name: Cache cargo
+      uses: Swatinem/rust-cache@v2
+    
+    - name: Install Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+        cache: 'pip'
+    
+    - name: Install Python deps
+      if: hashFiles('requirements.txt') != ''
+      run: |
+        pip install -r requirements.txt
+        pip install ruff pytest pytest-cov bandit pip-audit
+    
+    - name: Install Node.js
+      if: hashFiles('package.json') != ''
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm'
+    
+    - name: Install Node deps
+      if: hashFiles('package.json') != ''
+      run: npm ci
+    
+    - name: Run Ruff (Python lint)
+      if: hashFiles('**/*.py') != ''
+      run: |
+        ruff check .
+        ruff format --check .
+    
+    - name: Run Bandit (Python security)
+      if: hashFiles('**/*.py') != ''
+      run: bandit -r . -f json -o bandit-results.json || true
+    
+    - name: Run pip-audit
+      if: hashFiles('requirements.txt') != ''
+      run: pip-audit -r requirements.txt --format=json --output pip-audit.json || true
+    
+    - name: Run pytest with coverage
+      if: hashFiles('pytest.ini') != '' || hashFiles('pyproject.toml') != ''
+      run: |
+        pytest --cov=. --cov-report=xml --cov-report=term-missing -q || true
+    
+    - name: Run ESLint
+      if: hashFiles('package.json') != ''
+      run: npx eslint . --format=json --output-file=eslint-results.json || true
+    
+    - name: Run TypeScript check
+      if: hashFiles('package.json') != ''
+      run: npx tsc --noEmit || true
+    
+    - name: Run npm audit
+      if: hashFiles('package.json') != ''
+      run: npm audit --json --audit-level=high --output npm-audit.json || true
+    
+    - name: Run cargo clippy
+      if: hashFiles('Cargo.toml') != ''
+      run: cargo clippy --all-targets --all-features -- -D warnings
+    
+    - name: Run cargo audit
+      if: hashFiles('Cargo.toml') != ''
+      run: cargo audit --json --output cargo-audit.json || true
+    
+    - name: Run cargo tarpaulin
+      if: hashFiles('Cargo.toml') != ''
+      run: cargo tarpaulin --out Xml --output-dir coverage || true
+    
+    - name: Run PSScriptAnalyzer
+      if: hashFiles('**/*.ps1') != ''
+      run: |
+        Install-Module PSScriptAnalyzer -Force -Scope CurrentUser
+        Invoke-ScriptAnalyzer -Path . -Recurse -Severity Error,Warning -OutVariable issues
+        $issues | ConvertTo-Json | Out-File psscriptanalyzer-results.json
+    
+    - name: Run ShellCheck
+      if: hashFiles('**/*.sh') != ''
+      run: |
+        shellcheck -f json **/*.sh > shellcheck-results.json || true
+    
+    - name: Run shfmt
+      if: hashFiles('**/*.sh') != ''
+      run: shfmt -d **/*.sh || true
+    
+    - name: Upload security results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: security-results
+        path: |
+          bandit-results.json
+          pip-audit.json
+          npm-audit.json
+          cargo-audit.json
+          psscriptanalyzer-results.json
+          shellcheck-results.json
+        retention-days: 30
+
+  build:
+    needs: lint-and-test
+    runs-on: windows-latest
+    timeout-minutes: 20
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        submodules: false
+    
+    - name: Install Rust
+      if: hashFiles('Cargo.toml') != ''
+      uses: dtolnay/rust-toolchain@stable
+    
+    - name: Build Rust project
+      if: hashFiles('Cargo.toml') != ''
+      run: cargo build --release --all-features
+    
+    - name: Build Python package
+      if: hashFiles('pyproject.toml') != '' || hashFiles('setup.py') != ''
+      run: |
+        pip install build
+        python -m build
+    
+    - name: Build with PyInstaller
+      if: hashFiles('*.spec') != ''
+      run: |
+        pip install pyinstaller
+        pyinstaller *.spec --clean --noconfirm
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-artifacts
+        path: |
+          target/release/
+          dist/
+        retention-days: 7
