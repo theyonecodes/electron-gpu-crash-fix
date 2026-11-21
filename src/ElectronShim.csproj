@@ -13,6 +13,20 @@
     <DebugType>embedded</DebugType>
     <InvariantGlobalization>true</InvariantGlobalization>
     <UseAppHost>false</UseAppHost>
+    
+    <!-- Signing support -->
+    <SignAssembly Condition="'$(SignAssembly)' == ''">false</SignAssembly>
+    <AssemblyOriginatorKeyFile Condition="'$(AssemblyOriginatorKeyFile)' == ''"></AssemblyOriginatorKeyFile>
+    
+    <!-- Authenticode signing via signtool (post-build) -->
+    <PostBuildEvent Condition="'$(AuthenticodeSign)' == 'true'">
+      signtool sign /a /fd SHA256 /tr http://timestamp.sectigo.com /td SHA256 "$(TargetPath)"
+    </PostBuildEvent>
+    
+    <!-- ACL hardening post-publish -->
+    <Target Name="HardenedACL" AfterTargets="Publish">
+      <Exec Command="icacls "$(PublishDir)ElectronShim.exe" /inheritance:r /grant:r "SYSTEM:(RX)" "Administrators:(RX)"" />
+    </Target>
   </PropertyGroup>
 
 </Project>

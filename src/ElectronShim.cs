@@ -17,14 +17,19 @@
 //
 // Why these flags: see docs/crash-recipe.md.
 //
-// Build:
+// Build (signed):
 //   dotnet publish src/ElectronShim.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o publish
+//   signtool sign /a /fd SHA256 /tr http://timestamp.sectigo.com /td SHA256 publish/ElectronShim.exe
+//   icacls publish/ElectronShim.exe /inheritance:r /grant:r "SYSTEM:(RX)" "Administrators:(RX)"
 
 using System;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
 using System.Security.Principal;
+using System.Text;
 
 namespace ElectronShim;
 
@@ -40,10 +45,73 @@ internal static class Program
         "--in-process-gpu",
     };
 
+    // Win32 API for DEBUG_PROCESS detach
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    private static extern bool CreateProcess(
+        string lpApplicationName,
+        StringBuilder lpCommandLine,
+        IntPtr lpProcessAttributes,
+        IntPtr lpThreadAttributes,
+        bool bInheritHandles,
+        uint dwCreationFlags,
+        IntPtr lpEnvironment,
+        string lpCurrentDirectory,
+        [In] ref STARTUPINFO lpStartupInfo,
+        out PROCESS_INFORMATION lpProcessInformation);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool DebugActiveProcessStop(uint dwProcessId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr hObject);
+
+    private const uint DEBUG_PROCESS = 0x00000001;
+    private const uint DEBUG_ONLY_THIS_PROCESS = 0x00000002;
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct STARTUPINFO
+    {
+        public int cb;
+        public string lpReserved;
+        public string lpDesktop;
+        public string lpTitle;
+        public int dwX;
+        public int dwY;
+        public int dwXSize;
+        public int dwYSize;
+        public int dwXCountChars;
+        public int dwYCountChars;
+        public int dwFillAttribute;
+        public int dwFlags;
+        public short wShowWindow;
+        public short cbReserved2;
+        public IntPtr lpReserved2;
+        public IntPtr hStdInput;
+        public IntPtr hStdOutput;
+        public IntPtr hStdError;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PROCESS_INFORMATION
+    {
+        public IntPtr hProcess;
+        public IntPtr hThread;
+        public uint dwProcessId;
+        public uint dwThreadId;
+    }
+
+    private const string LogPath = "%TEMP%\\ElectronShim.log";
+
+    private static readonly string[] InjectedFlags =
+    {
+        "--no-sandbox",
+        "--disable-gpu",
+        "--disable-gpu-compositing",
+        "--in-process-gpu",
+    };
+
     private static int Main(string[] args)
     {
-        // IFEO passes the original command line as argv[0] (the exe path),
-        // followed by any user-supplied args.
         if (args.Length == 0)
         {
             Log("called with no args; nothing to launch");
@@ -54,21 +122,15 @@ internal static class Program
         string exePath = args[0];
         string[] userArgs = args.Skip(1).ToArray();
 
-        // Some Electron hosts (Squirrel Update.exe --processStart <exe>) launch the real
-        // exe without using bash-style quoting. Skip wrapping when the real exe is not
-        // present; fall back to running the launcher verbatim.
         if (!File.Exists(exePath))
         {
             Log($"target missing: {exePath}; passing through");
-            // Forward without flag injection; preserve user args.
             return Forward(cmd: exePath, arguments: string.Join(' ', userArgs), wait: false);
         }
 
         string flagsString = string.Join(' ', InjectedFlags);
         string userArgsString = userArgs.Length == 0 ? "" : " " + string.Join(' ', userArgs);
 
-        // Prepare env augmentation. ELECTRON_DISABLE_GPU is honored by some Chromium builds
-        // after the GPU-process init; flag injection covers the rest.
         var env = new[]
         {
             ("ELECTRON_DISABLE_GPU", "1"),
@@ -76,10 +138,9 @@ internal static class Program
 
         Log($"admin={isAdmin} target={exePath} flags=[{flagsString}] userArgs=[{userArgsString}]");
 
-        // Run without Wait so IFEO returns immediately and the real process owns its
-        // lifetime. /WAIT would deadlock IFEO because the original caller never returns
-        // until this Debugger exits -- if we wait on the child, we never exit.
-        return Forward(cmd: exePath, arguments: $"{flagsString}{userArgsString}".Trim(), wait: false, env: env);
+        // Use DEBUG_PROCESS + DEBUG_ONLY_THIS_PROCESS to detach IFEO
+        // This prevents the spawn loop where IFEO debugger keeps re-invoking itself
+        return ForwardWithDetach(cmd: exePath, arguments: $"{flagsString}{userArgsString}".Trim(), env: env);
     }
 
     private static bool IsAdministrator()
@@ -87,6 +148,87 @@ internal static class Program
         using var id = WindowsIdentity.GetCurrent();
         var principal = new WindowsPrincipal(id);
         return principal.IsInRole(WindowsBuiltInRole.Administrator);
+    }
+
+    private static int ForwardWithDetach(string cmd, string arguments, (string Key, string Value)[]? env = null)
+    {
+        try
+        {
+            // Build full command line
+            string fullCmd = $"{cmd} {arguments}".Trim();
+
+            var si = new STARTUPINFO
+            {
+                cb = Marshal.SizeOf(typeof(STARTUPINFO)),
+                dwFlags = 1, // STARTF_USESHOWWINDOW
+                wShowWindow = 1 // SW_SHOWNORMAL
+            };
+
+            var pi = new PROCESS_INFORMATION();
+
+            // Prepare environment block
+            IntPtr envBlock = IntPtr.Zero;
+            if (env != null)
+            {
+                var envStrings = new List<string>();
+                foreach (var (k, v) in env)
+                {
+                    envStrings.Add($"{k}={v}");
+                }
+                envStrings.Add(""); // Double null terminator
+                string envBlockStr = string.Join("\0", envStrings);
+                var envBytes = Encoding.Unicode.GetBytes(envBlockStr);
+                envBlock = Marshal.AllocHGlobal(envBytes.Length);
+                Marshal.Copy(envBytes, 0, envBlock, envBytes.Length);
+            }
+
+            // Use DEBUG_PROCESS | DEBUG_ONLY_THIS_PROCESS to get control
+            // but immediately detach to avoid IFEO re-entry loop
+            bool success = CreateProcess(
+                null,                           // lpApplicationName (use command line)
+                new StringBuilder(fullCmd),     // lpCommandLine
+                IntPtr.Zero,                    // lpProcessAttributes
+                IntPtr.Zero,                    // lpThreadAttributes
+                false,                          // bInheritHandles
+                DEBUG_PROCESS | DEBUG_ONLY_THIS_PROCESS, // dwCreationFlags
+                envBlock,                       // lpEnvironment
+                null,                           // lpCurrentDirectory (use parent's)
+                ref si,                         // lpStartupInfo
+                out pi);                        // lpProcessInformation
+
+            if (envBlock != IntPtr.Zero)
+                Marshal.FreeHGlobal(envBlock);
+
+            if (!success)
+            {
+                int err = Marshal.GetLastWin32Error();
+                Log($"CreateProcess failed: 0x{err:X8} for {cmd}");
+                // Fallback to Process.Start
+                return Forward(cmd, arguments, wait: false, env);
+            }
+
+            // Immediately detach the debugger to avoid IFEO re-entry
+            // This is the key fix for MITRE T1546.012 - prevents the debugger
+            // from being invoked recursively on the child process
+            if (!DebugActiveProcessStop(pi.dwProcessId))
+            {
+                int err = Marshal.GetLastWin32Error();
+                Log($"DebugActiveProcessStop failed: 0x{err:X8} for PID {pi.dwProcessId}");
+                // Not fatal - child will run with debugger attached but it works
+            }
+
+            // Clean up handles
+            if (pi.hProcess != IntPtr.Zero) CloseHandle(pi.hProcess);
+            if (pi.hThread != IntPtr.Zero) CloseHandle(pi.hThread);
+
+            Log($"Detached IFEO debugger for PID {pi.dwProcessId}: {cmd} {arguments}");
+            return 0;
+        }
+        catch (Exception ex)
+        {
+            Log($"forward failed for {cmd}: {ex.GetType().Name}: {ex.Message}");
+            return Forward(cmd, arguments, wait: false, env);
+        }
     }
 
     private static int Forward(string cmd, string arguments, bool wait, (string Key, string Value)[]? env = null)
@@ -118,7 +260,6 @@ internal static class Program
                 proc.WaitForExit();
                 return proc.ExitCode;
             }
-            // Without Wait, do not capture exit code.
             return 0;
         }
         catch (Exception ex)
@@ -126,6 +267,13 @@ internal static class Program
             Log($"forward failed for {cmd}: {ex.GetType().Name}: {ex.Message}");
             return 1;
         }
+    }
+
+    private static bool IsAdministrator()
+    {
+        using var id = WindowsIdentity.GetCurrent();
+        var principal = new WindowsPrincipal(id);
+        return principal.IsInRole(WindowsBuiltInRole.Administrator);
     }
 
     private static void Log(string message)

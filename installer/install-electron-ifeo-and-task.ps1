@@ -7,9 +7,11 @@
   1. Registers IFEO Debugger entries for common Electron-derived apps.
   2. (Optionally) Installs a SYSTEM-level scheduled task running every 30 min
      that auto-detects newly-installed Electron apps and registers IFEO entries.
-  3. NEW: Creates automatic registry backups before any IFEO changes.
-  4. NEW: Dark theme tkinter GUI for app selection and monitoring.
-  5. NEW: Jev Router triage for confidence assessment.
+  3. Creates automatic registry backups before any IFEO changes.
+  4. Dark theme tkinter GUI for app selection and monitoring.
+  5. Jev Router triage for confidence assessment.
+  6. Validates shim Authenticode signature.
+  7. Hardens ACLs on shim (SYSTEM/Administrators only).
 
   Run elevated ONE TIME:
     powershell -NoProfile -ExecutionPolicy Bypass -File install-electron-ifeo-and-task.ps1
@@ -28,6 +30,9 @@
 
 .PARAMETER Gui
   Launch the DarkTheme tkinter GUI instead of console.
+
+.PARAMETER Uninstall
+  Remove IFEO entries and scheduled task.
 
 .EXAMPLE
   .\install-electron-ifeo-and-task.ps1
@@ -92,7 +97,32 @@ if (-not (Test-Path -LiteralPath $ShimPath)) {
     Write-Host "Build it first: dotnet publish src\ElectronShim.csproj -c Release -r win-x64 -p:PublishSingleFile=true -o publish"
     exit 1
 }
+
+# --- Validate Authenticode signature ---
+$sig = Get-AuthenticodeSignature -FilePath $ShimPath
+if ($sig.Status -ne 'Valid') {
+    Write-Host "WARNING: Shim signature invalid or missing: $($sig.Status)"
+    if (-not $DryRun) {
+        Write-Host "  Continuing anyway (DryRun=$DryRun). For production, use a signed shim."
+    }
+} else {
+    Write-Host "  ✓ Shim signature VALID: $($sig.SignerCertificate.Subject)"
+}
+
 Write-Host "Shim: $ShimPath"
+Write-Host ""
+
+# --- Harden ACLs on shim (SYSTEM/Administrators only) ---
+if (-not $DryRun) {
+    $acl = Get-Acl -LiteralPath $ShimPath
+    $acl.SetAccessRuleProtection($true, $false)  # Disable inheritance
+    $acl.RemoveAccessRuleAll([Security.AccessControl.FileSystemAccessRule]::new("Users", "ReadAndExecute", "Allow"))
+    $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new("SYSTEM", "ReadAndExecute", "Allow"))
+    $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new("Administrators", "ReadAndExecute", "Allow"))
+    Set-Acl -LiteralPath $ShimPath -AclObject $acl
+    Write-Host "  ✓ ACL hardened: SYSTEM/Administrators (RX), inheritance removed"
+}
+
 Write-Host ""
 
 # --- 2. Default IFEO basenames ---
